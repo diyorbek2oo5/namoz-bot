@@ -1,0 +1,7 @@
+aiogram
+beautifulsoup4
+aiohttp
+pytz
+apscheduler
+flask
+gunicorn
