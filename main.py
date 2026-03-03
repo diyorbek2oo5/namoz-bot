@@ -1,16 +1,15 @@
 import logging
 import asyncio
-import aiohttp
 import sqlite3
 import pytz
+import os
+from io import BytesIO
 from datetime import datetime, timedelta
-from flask import Flask
-from threading import Thread
+from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import KeyboardButton, BufferedInputFile
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- SOZLAMALAR ---
 TOKEN = "8579347386:AAHILzZJHV9GgYhugQklOVzhWGDpSy5LD6o"
@@ -18,170 +17,143 @@ ADMIN_ID = 5514492628
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler(timezone=TASHKENT_TZ)
 
-# --- VILOYATLAR ---
+# Viloyat farqlari
 REGION_OFFSETS = {
     "Toshkent": 0, "Andijon": -10, "Farg'ona": -10, "Namangan": -8,
     "Guliston": 2, "Jizzax": 6, "Samarqand": 9, "Buxoro": 21,
     "Navoiy": 14, "Qarshi": 15, "Termiz": 7, "Urganch": 35, "Nukus": 38
 }
 
-PRAYER_DETAILS = {
-    "Bomdod": "2 rakat sunnat, 2 rakat farz",
-    "Peshin": "4 rakat sunnat, 4 rakat farz, 2 rakat sunnat",
-    "Asr": "4 rakat farz",
-    "Shom": "3 rakat farz, 2 rakat sunnat",
-    "Xufton": "4 rakat farz, 2 rakat sunnat, 3 rakat vitr"
-}
-
-# Tezkorlik uchun xotira (Cache)
-DAILY_CACHE = {}
-
 # --- BAZA ---
-def db_setup():
-    with sqlite3.connect("namoz_pro.db") as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, region TEXT)")
-        conn.execute("CREATE TABLE IF NOT EXISTS times (date TEXT PRIMARY KEY, bomdod TEXT, quyosh TEXT, peshin TEXT, asr TEXT, shom TEXT, hufton TEXT)")
-
 def db_query(query, params=(), fetch=False):
-    with sqlite3.connect("namoz_pro.db") as conn:
+    with sqlite3.connect("namoz_photo.db") as conn:
         cursor = conn.execute(query, params)
         return cursor.fetchall() if fetch else conn.commit()
 
-# --- YORDAMCHI FUNKSIYALAR ---
-def adjust_time(time_str, offset_min):
+def db_setup():
+    db_query("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, region TEXT)")
+    db_query("CREATE TABLE IF NOT EXISTS times (date TEXT PRIMARY KEY, b TEXT, p TEXT, a TEXT, s TEXT, h TEXT)")
+
+# --- RASMGA YOZISH FUNKSIYASI ---
+def create_prayer_image(region, date_str, times):
     try:
-        t = datetime.strptime(time_str, "%H:%M")
-        return (t + timedelta(minutes=offset_min)).strftime("%H:%M")
-    except: return time_str
+        img = Image.open("shablon.jpg")
+        draw = ImageDraw.Draw(img)
+        
+        # Windowsda shrift yo'li (agar xato bersa buni o'zgartirish kerak)
+        try:
+            # Kompyuteringizda arial shrifti bo'lsa:
+            font_path = "arial.ttf" 
+            font_title = ImageFont.truetype(font_path, 65) # Viloyat uchun
+            font_date = ImageFont.truetype(font_path, 35)  # Sana uchun
+            font_time = ImageFont.truetype(font_path, 55)  # Vaqtlar uchun
+        except:
+            font_title = font_date = font_time = ImageFont.load_default()
 
-async def update_cache():
-    """Barcha viloyatlar vaqtini xotiraga yuklash (Tezlik siri)"""
-    global DAILY_CACHE
-    date_now = datetime.now(TASHKENT_TZ).strftime("%d.%m")
-    res = db_query("SELECT * FROM times WHERE date=?", (date_now,), fetch=True)
-    
-    if res:
-        r = res[0]
-        for region, off in REGION_OFFSETS.items():
-            DAILY_CACHE[region] = {
-                "bomdod": adjust_time(r[1], off),
-                "quyosh": adjust_time(r[2], off),
-                "peshin": adjust_time(r[3], off),
-                "asr": adjust_time(r[4], off),
-                "shom": adjust_time(r[5], off),
-                "hufton": adjust_time(r[6], off)
-            }
-        logging.info("Kesh yangilandi.")
-    else:
-        DAILY_CACHE = {}
+        # 1. "YUQORI CHO'JA" yozuvini yopish va yangi viloyatni yozish
+        # Koordinatalar shablonga moslangan
+        draw.rectangle([300, 70, 750, 160], fill=(255, 255, 255)) # Oq bilan yopish
+        draw.text((512, 115), region.upper(), fill=(14, 38, 101), font=font_title, anchor="mm")
 
-async def get_weather(region):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://wttr.in/{region}?format=%t+%C", timeout=3) as resp:
-                return await resp.text() if resp.status == 200 else ""
-    except: return ""
+        # 2. Sanani yozish
+        draw.text((512, 260), date_str, fill=(0, 0, 0), font=font_date, anchor="mm")
 
-# --- WEB SERVER ---
-app = Flask('')
-@app.route('/')
-def home(): return "OK"
-def run_web(): app.run(host='0.0.0.0', port=8080)
+        # 3. Vaqtlarni joylashtirish
+        # Bomdod (Chap tepa)
+        draw.text((250, 360), times['b'], fill="white", font=font_time, anchor="mm")
+        # Peshin (O'ng tepa)
+        draw.text((770, 360), times['p'], fill="white", font=font_time, anchor="mm")
+        # Asr (Chap past)
+        draw.text((250, 600), times['a'], fill="white", font=font_time, anchor="mm")
+        # Shom (O'ng past)
+        draw.text((770, 600), times['s'], fill="white", font=font_time, anchor="mm")
+        # Xufton (Markaz past)
+        draw.text((512, 825), times['h'], fill="white", font=font_time, anchor="mm")
 
-# --- TUGMALAR ---
-def get_main_kb():
+        # 4. Pastdagi telegram manzilni o'chirish
+        draw.rectangle([600, 930, 980, 990], fill=(255, 255, 255))
+
+        bio = BytesIO()
+        img.save(bio, 'JPEG')
+        bio.seek(0)
+        return bio
+    except Exception as e:
+        logging.error(f"Rasm yaratishda xato: {e}")
+        return None
+
+# --- BOT OBYEKTLARI ---
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
     builder = ReplyKeyboardBuilder()
     for r in REGION_OFFSETS.keys():
         builder.add(KeyboardButton(text=r))
     builder.adjust(2)
-    return builder.as_markup(resize_keyboard=True)
-
-# --- HANDLERLAR ---
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("✨ <b>Assalomu alaykum!</b>\nHudud tanlang:", reply_markup=get_main_kb(), parse_mode="HTML")
+    await message.answer("✨ Assalomu alaykum! Viloyatingizni tanlang:", 
+                         reply_markup=builder.as_markup(resize_keyboard=True))
 
 @dp.message(Command("set"))
 async def cmd_set(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     try:
-        p = message.text.split()
-        if len(p) != 8:
-            await message.answer("⚠️ Format: `/set 28.02 05:30 06:50 12:40 16:15 18:25 19:45`", parse_mode="Markdown")
+        p = message.text.split() # /set 28.02 05:40 12:45 17:25 19:30 21:05
+        if len(p) != 7:
+            await message.answer("⚠️ Format: `/set 28.02 BOM PESH ASR SHOM XUF`")
             return
-        db_query("INSERT OR REPLACE INTO times VALUES (?, ?, ?, ?, ?, ?, ?)", (p[1], p[2], p[3], p[4], p[5], p[6], p[7]))
-        await update_cache() # Keshni darhol yangilash
-        await message.answer(f"✅ <b>Toshkent vaqtlari saqlandi!</b>\nBarcha hududlar keshi yangilandi.", parse_mode="HTML")
-    except Exception as e: await message.answer(f"Xato: {e}")
-
-@dp.message(Command("sent"))
-async def cmd_broadcast(message: types.Message):
-    if message.from_user.id != ADMIN_ID: return
-    text = message.text.replace("/sent", "").strip()
-    if not text:
-        await message.answer("⚠️ Yuborish uchun matn yozing: `/sent Xabar`", parse_mode="Markdown")
-        return
-    
-    users = db_query("SELECT user_id FROM users", fetch=True)
-    count = 0
-    for u in users:
-        try:
-            await bot.send_message(u[0], text)
-            count += 1
-            await asyncio.sleep(0.05) # Telegram bloklamasligi uchun
-        except: pass
-    await message.answer(f"📢 Xabar {count} ta foydalanuvchiga yuborildi.")
+        db_query("INSERT OR REPLACE INTO times VALUES (?, ?, ?, ?, ?, ?)", (p[1], p[2], p[3], p[4], p[5], p[6]))
+        await message.answer(f"✅ {p[1]} sanasi uchun vaqtlar saqlandi.")
+    except Exception as e:
+        await message.answer(f"Xato: {e}")
 
 @dp.message(F.text.in_(REGION_OFFSETS.keys()))
-async def show_times(message: types.Message):
+async def handle_region(message: types.Message):
     region = message.text
     db_query("INSERT OR REPLACE INTO users (user_id, region) VALUES (?, ?)", (message.from_user.id, region))
     
-    data = DAILY_CACHE.get(region)
-    if not data:
-        await message.answer("⚠️ Bugun uchun vaqtlar kiritilmagan.")
+    date_now = datetime.now(TASHKENT_TZ).strftime("%d.%m")
+    res = db_query("SELECT * FROM times WHERE date=?", (date_now,), fetch=True)
+    
+    if not res:
+        await message.answer("⚠️ Admin hali bugungi vaqtlarni kiritmadi.")
         return
 
-    weather = await get_weather(region)
-    text = (f"📍 <b>Hudud: {region}</b>\n"
-            f"🌡 Ob-havo: {weather}\n\n"
-            f"🏙 Bomdod: <b>{data['bomdod']}</b>\n"
-            f"🌅 Quyosh: <b>{data['quyosh']}</b>\n"
-            f"☀️ Peshin: <b>{data['peshin']}</b>\n"
-            f"🌇 Asr: <b>{data['asr']}</b>\n"
-            f"🌆 Shom: <b>{data['shom']}</b>\n"
-            f"🌃 Xufton: <b>{data['hufton']}</b>\n\n"
-            f"📅 {datetime.now(TASHKENT_TZ).strftime('%d.%m.%Y')}")
-    await message.answer(text, parse_mode="HTML")
+    r = res[0]
+    off = REGION_OFFSETS[region]
+    
+    def adj(t, m):
+        return (datetime.strptime(t, "%H:%M") + timedelta(minutes=m)).strftime("%H:%M")
 
-# --- ESLATMA TIZIMI ---
-async def check_reminders():
-    now_str = (datetime.now(TASHKENT_TZ) + timedelta(minutes=5)).strftime("%H:%M")
-    prayer_names = {"bomdod":"Bomdod", "peshin":"Peshin", "asr":"Asr", "shom":"Shom", "hufton":"Xufton"}
+    times = {
+        'b': adj(r[1], off), 'p': adj(r[2], off),
+        'a': adj(r[3], off), 's': adj(r[4], off), 'h': adj(r[5], off)
+    }
 
-    for region, times in DAILY_CACHE.items():
-        for key, val in times.items():
-            if key in prayer_names and val == now_str:
-                rakatlar = PRAYER_DETAILS.get(prayer_names[key], "")
-                users = db_query("SELECT user_id FROM users WHERE region=?", (region,), fetch=True)
-                for u in users:
-                    try: 
-                        await bot.send_message(u[0], f"🔔 <b>{prayer_names[key]}</b> vaqtiga 5 daqiqa qoldi!\n📍 {region}\n\n📖 {rakatlar}", parse_mode="HTML")
-                    except: pass
+    # Bugungi sana o'zbekcha formatda
+    date_full = datetime.now(TASHKENT_TZ).strftime("%d %B %Y")
+    
+    # Rasm tayyorlash
+    photo_buffer = create_prayer_image(region, date_full, times)
+    
+    if photo_buffer:
+        photo = BufferedInputFile(photo_buffer.read(), filename="namoz.jpg")
+        await message.answer_photo(photo=photo, caption=f"📍 {region} viloyati namoz vaqtlari")
+    else:
+        await message.answer("❌ Xatolik: `shablon.jpg` fayli topilmadi yoki rasmda xato.")
 
 async def main():
     db_setup()
-    await update_cache()
-    scheduler.add_job(update_cache, 'cron', hour=0, minute=1)
-    scheduler.add_job(check_reminders, 'interval', minutes=1)
-    scheduler.start()
-    await dp.start_polling(bot)
+    # Windowsda xatolik bermasligi uchun pollingni xavfsiz boshlash
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == '__main__':
-    Thread(target=run_web).start()
-    asyncio.run(main())
+    # Windows 10013 xatosini oldini olish uchun (Ba'zi tizimlarda kerak)
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Bot to'xtadi: {e}")

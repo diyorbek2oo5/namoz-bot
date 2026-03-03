@@ -1,5 +1,7 @@
 aiogram
 aiohttp
 apscheduler
+Pillow
 pytz
 flask
+gunicorn
